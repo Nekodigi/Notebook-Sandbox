@@ -1,1 +1,4 @@
 mnist/*
+inputs/*
+outputs/*
+diffusers/*

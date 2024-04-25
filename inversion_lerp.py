@@ -1,126 +1,154 @@
+import os
 from io import BytesIO
 
+import PIL
+import PIL.Image
 import requests
 import torch
+import tqdm
 from diffusers import DDIMScheduler, StableDiffusionPipeline
 from PIL import Image
 from torchvision.transforms import functional as T
-import tqdm
+from transformers import BlipForConditionalGeneration, BlipProcessor
+
+from diffusion.ddim_invert import invert, sample
 
 
-def load_image(url, size=None):
-    response = requests.get(url, timeout=0.2)
-    img = Image.open(BytesIO(response.content)).convert("RGB")
-    if size is not None:
-        img = img.resize(size)
-    return img
+class DiffusionTools:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.pipe = StableDiffusionPipeline.from_pretrained(
+            "CompVis/stable-diffusion-v1-4"
+        ).to(self.device)
+        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
 
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-pipe = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4").to(
-    device
-)
-
-pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-
-input_image = load_image(
-    "https://cdn.pixabay.com/photo/2015/10/09/00/55/lotus-978659_1280.jpg",
-    size=(512, 512),
-)
-input_image_prompt = "Photograph of lotus flower in a pond"
-
-with torch.no_grad():
-    latent = pipe.vae.encode(T.to_tensor(input_image).unsqueeze(0).to(device) * 2 - 1)
-l = 0.18215 * latent.latent_dist.sample()
-
-
-## Inversion
-@torch.no_grad()
-def invert(
-    start_latents,
-    prompt,
-    guidance_scale=3.5,
-    num_inference_steps=80,
-    num_images_per_prompt=1,
-    do_classifier_free_guidance=True,
-    negative_prompt="",
-    device=device,
-):
-
-    # Encode prompt
-    text_embeddings = pipe._encode_prompt(
-        prompt,
-        device,
-        num_images_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt,
-    )
-
-    # Latents are now the specified start latents
-    latents = start_latents.clone()
-
-    # We'll keep a list of the inverted latents as the process goes on
-    intermediate_latents = []
-
-    # Set num inference steps
-    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
-
-    # Reversed timesteps <<<<<<<<<<<<<<<<<<<<
-    timesteps = reversed(pipe.scheduler.timesteps)
-
-    for i in tqdm(range(1, num_inference_steps), total=num_inference_steps - 1):
-
-        # We'll skip the final iteration
-        if i >= num_inference_steps - 1:
-            continue
-
-        t = timesteps[i]
-
-        # Expand the latents if we are doing classifier free guidance
-        latent_model_input = (
-            torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        self.processor = BlipProcessor.from_pretrained(
+            "Salesforce/blip-image-captioning-large"
         )
-        latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+        self.model = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-large", torch_dtype=torch.float16
+        ).to("cuda")
 
-        # Predict the noise residual
-        noise_pred = pipe.unet(
-            latent_model_input, t, encoder_hidden_states=text_embeddings
-        ).sample
+    def load_image(self, url, size=None):
+        # also support local image
+        if url.startswith("http"):
+            response = requests.get(url, timeout=0.2)
+            img = Image.open(BytesIO(response.content)).convert("RGB")
+            if size is not None:
+                img = img.resize(size)
+            return img
+        else:
+            img = Image.open(url).convert("RGB")
+            if size is not None:
+                img = img.resize(size)
+            return img
 
-        # Perform guidance
-        if do_classifier_free_guidance:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_text - noise_pred_uncond
+    def preprocess_img(self, url):
+        input_image = self.load_image(
+            url,
+            size=(512, 512),
+        )
+        init = "tongue which is "
+        inputs = self.processor(input_image, init, return_tensors="pt").to(
+            "cuda", torch.float16
+        )  # type: ignore
+        out = self.model.generate(**inputs)
+        prompt = self.processor.decode(out[0], skip_special_tokens=True)
+        print(prompt)
+
+        with torch.no_grad():
+            latent = self.pipe.vae.encode(
+                T.to_tensor(input_image).unsqueeze(0).to(self.device) * 2 - 1
             )
+        l = 0.18215 * latent.latent_dist.sample()
+        return input_image, l, prompt
 
-        current_t = max(0, t.item() - (1000 // num_inference_steps))  # t
-        next_t = t  # min(999, t.item() + (1000//num_inference_steps)) # t+1
-        alpha_t = pipe.scheduler.alphas_cumprod[current_t]
-        alpha_t_next = pipe.scheduler.alphas_cumprod[next_t]
+    def invert(
+        self,
+        start_latents,
+        prompt,
+        guidance_scale=3.5,
+        num_inference_steps=80,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=True,
+        negative_prompt="",
+    ):
+        return invert(
+            self.pipe,
+            start_latents,
+            prompt,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            device=self.device,
+        )
 
-        # Inverted update step (re-arranging the update step to get x(t) (new latents) as a function of x(t-1) (current latents)
-        latents = (latents - (1 - alpha_t).sqrt() * noise_pred) * (
-            alpha_t_next.sqrt() / alpha_t.sqrt()
-        ) + (1 - alpha_t_next).sqrt() * noise_pred
+    def sample(
+        self,
+        prompt,
+        start_step=0,
+        start_latents=None,
+        guidance_scale=3.5,
+        num_inference_steps=30,
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=True,
+        negative_prompt="",
+    ):
+        return sample(
+            self.pipe,
+            prompt,
+            start_step=start_step,
+            start_latents=start_latents,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            device=self.device,
+        )
 
-        # Store
-        intermediate_latents.append(latents)
+    def decode(self, latent) -> PIL.Image.Image:
+        with torch.no_grad():
+            im = self.pipe.decode_latents(latent.unsqueeze(0))
+        img = self.pipe.numpy_to_pil(im)[0]
+        return img
 
-    return torch.cat(intermediate_latents)
+    def cfg_step_multisample(
+        self,
+        name,
+        prompt,
+        inverted_latents,
+        step_start=20,
+        step_step=10,
+        cfg_end=20,
+        cfg_step=5,
+    ):
+        for step in range(step_start, inverted_latents.shape[0], step_step):
+            for cfg in range(1, cfg_end, cfg_step):
+                img = self.sample(
+                    prompt,
+                    start_latents=inverted_latents[-(step + 1)][None],
+                    start_step=step,
+                    num_inference_steps=50,
+                    guidance_scale=cfg,
+                )[0]
+                os.makedirs(f"outputs/image/{name}", exist_ok=True)
+                img.save(f"outputs/image/{name}/{step}_{cfg}.png")
 
 
-inverted_latents = invert(l, input_image_prompt, num_inference_steps=50)
-inverted_latents.shape
-print("AAA")
+dt = DiffusionTools()
+for i in range(10):
+    url = f"inputs/image/{i}.png"  # https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQ7L7GME1MADKK-d5K1zKdnTZxNHc0w12yYRw&usqp=CAU
 
-# Decode the final inverted latents
-with torch.no_grad():
-    im = pipe.decode_latents(inverted_latents[-1].unsqueeze(0))
-img = pipe.numpy_to_pil(im)[0]
+    img, l, prompt = dt.preprocess_img(url)
 
-# show this img
+    inverted_latents = dt.invert(l, prompt, num_inference_steps=50)
+    inverted_latents.shape
+    print("AAA")
 
-img.show()
+    # # Decode the final inverted latents
+    # img = dt.decode(inverted_latents[0])
+    # img.save("outputs/image/0.png")
+    dt.cfg_step_multisample(i, prompt, inverted_latents)
